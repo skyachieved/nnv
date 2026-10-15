@@ -105,44 +105,46 @@ classdef TransposedConv2DLayer < handle
                         error('Invalid weight matrix');
                     end
                     
-                    if length(b) ~= 3
-                        error('Invalid biases array');
+                    if ndims(filter_bias) < 2
+                        error('Invalid biases array (must be 3D: [1, 1, NumFilters])');
                     else
                         obj.Bias = filter_bias;
                     end
 
-                    if length(w) == 4 && w(3) ~= b(3)
+                    % Use size(...,k) which returns 1 for missing trailing
+                    % dims; ndims() strips trailing singletons so length(b)
+                    % can wrongly be 2 when filter_bias is [1,1,1].
+                    bias_F = size(filter_bias, 3);
+                    if length(w) == 4 && w(3) ~= bias_F
                         error('Inconsistency between filter weights and filter biases');
                     end
-                    
-                    p = size(cropping_mat);
-                    if length(p) ~= 4 || p(1) ~= 1
-                        error('Invalid cropping matrix');
+
+                    if numel(cropping_mat) ~= 4 || ~isrow(cropping_mat)
+                        error('Invalid cropping matrix (must be [1x4])');
                     end
                     obj.CroppingSize = cropping_mat;
-                                               
-                    s = size(stride_mat);
-                    if length(s) ~= 2 || s(1) ~= 1
-                        error('Invalid stride matrix');
+
+                    if numel(stride_mat) ~= 2 || ~isrow(stride_mat)
+                        error('Invalid stride matrix (must be [1x2])');
                     end
-                    obj.Stride = stride_mat;  
+                    obj.Stride = stride_mat;
 
                 case 4
-                    
+
                     filter_weights = varargin{1};
                     filter_bias = varargin{2};
                     cropping_mat = varargin{3};
                     stride_mat = varargin{4};
-                    
+
                     w = size(filter_weights);
                     b = size(filter_bias);
-                    
+
                     if length(w) == 2
                         obj.NumFilters = 1;
                         obj.NumChannels = 1;
                         obj.FilterSize = [w(1) w(2)];
                         obj.Weights = filter_weights;
-                        
+
                     elseif length(w) == 3
                         obj.NumFilters = w(3);
                         obj.NumChannels = 1;
@@ -156,29 +158,28 @@ classdef TransposedConv2DLayer < handle
                     else
                         error('Invalid weight matrix');
                     end
-                    
-                    if length(b) ~= 3
-                        error('Invalid biases array');
+
+                    if ndims(filter_bias) < 2
+                        error('Invalid biases array (must be 3D: [1, 1, NumFilters])');
                     else
                         obj.Bias = filter_bias;
                     end
 
-                    if length(w) == 4 && w(3) ~= b(3)
+                    bias_F = size(filter_bias, 3);
+                    if length(w) == 4 && w(3) ~= bias_F
                         error('Inconsistency between filter weights and filter biases');
                     end
-                    
-                    p = size(cropping_mat);
-                    if length(p) ~= 4 || p(1) ~= 1
-                        error('Invalid cropping matrix');
+
+                    if numel(cropping_mat) ~= 4 || ~isrow(cropping_mat)
+                        error('Invalid cropping matrix (must be [1x4])');
                     end
                     obj.CroppingSize = cropping_mat;
-                                               
-                    s = size(stride_mat);
-                    if length(s) ~= 2 || s(1) ~= 1
-                        error('Invalid stride matrix');
+
+                    if numel(stride_mat) ~= 2 || ~isrow(stride_mat)
+                        error('Invalid stride matrix (must be [1x2])');
                     end
-                    obj.Stride = stride_mat;  
-                    
+                    obj.Stride = stride_mat;
+
                 case 2
                     
                     filter_weights = varargin{1};
@@ -205,14 +206,15 @@ classdef TransposedConv2DLayer < handle
                         obj.Weights = filter_weights;
                     else
                         error('Invalid weight matrix');
-                    end                  
+                    end
 
                     obj.Bias = filter_bias;
 
-                    if length(w) == 4 && w(3) ~= b(3)
+                    bias_F = size(filter_bias, 3);
+                    if length(w) == 4 && w(3) ~= bias_F
                         error('Inconsistency between filter weights and filter biases');
                     end
-                                    
+
                 otherwise
                     error('Invalid number of inputs (should be 2, 5, or 6)');
                                  

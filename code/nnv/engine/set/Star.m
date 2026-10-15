@@ -370,20 +370,46 @@ classdef Star
             else
                 V3 = horzcat(V1, V2);
                 new_c = obj.V(:, 1) + X.V(:, 1);
-                new_V = horzcat(new_c, V3);        
-                new_C = blkdiag(obj.C, X.C);        
+                new_V = horzcat(new_c, V3);
+                new_C = blkdiag(obj.C, X.C);
                 new_d = vertcat(obj.d, X.d);
-                new_pred_lb = [obj.predicate_lb; X.predicate_lb];
-                new_pred_ub = [obj.predicate_ub; X.predicate_ub];
-                S = Star(new_V, new_C, new_d, new_pred_lb, new_pred_ub); % new Star has more number of basic vectors
+                % concatenating bounds is only valid when each operand's
+                % bounds cover all of its predicate variables (a
+                % 0-predicate star with 0x1 bounds counts as covered);
+                % otherwise the constructor would reject the short vector
+                if size(obj.predicate_lb, 1) == obj.nVar && size(obj.predicate_ub, 1) == obj.nVar ...
+                        && size(X.predicate_lb, 1) == X.nVar && size(X.predicate_ub, 1) == X.nVar
+                    new_pred_lb = [obj.predicate_lb; X.predicate_lb];
+                    new_pred_ub = [obj.predicate_ub; X.predicate_ub];
+                    S = Star(new_V, new_C, new_d, new_pred_lb, new_pred_ub); % new Star has more number of basic vectors
+                else
+                    S = Star(new_V, new_C, new_d);
+                end
             end
-                
+
         end
-        
+
         function S = HadamardProduct(obj, X)
+            % HadamardProduct - sound over-approximation of the elementwise
+            % product of two stars, z = x .* y for x in obj, y in X.
+            %
             % @X: another star with same dimension
-            % @S: new star
-            
+            % @S: new star, guaranteed to contain {x .* y : x in obj, y in X}
+            %
+            % For each output neuron z(i) = x(i)*y(i) with x(i) in [lx, ux]
+            % and y(i) in [ly, uy], one new predicate variable z(i) is
+            % introduced, bounded by the four McCormick inequalities
+            %
+            %   z >= lx*y + ly*x - lx*ly      z <= ux*y + ly*x - ux*ly
+            %   z >= ux*y + uy*x - ux*uy      z <= lx*y + uy*x - lx*uy
+            %
+            % which are linear in the predicate variables after substituting
+            % the affine forms of x and y, and enclose the bilinear term
+            % over the box [lx,ux] x [ly,uy]. The two stars are treated as
+            % independent (their predicate variables are not identified,
+            % even if their constraints coincide), which always yields a
+            % superset of the product under any dependency between them.
+
             if ~isa(X, 'Star')
                 error('Input matrix is not a Star');
             else
@@ -391,27 +417,71 @@ classdef Star
                     error('Input star and current star have different dimensions');
                 end
             end
-            
-            m1 = size(obj.V, 2);
-            m2 = size(X.V, 2);
-            V1 = obj.V(:, 2:m1);
-            V2 = X.V(:, 2:m2);
-            new_c = obj.V(:, 1) .* X.V(:, 1);
-            
-            % check if two Star has the same constraints
-            if size(obj.C, 1) == size(X.C, 1) && size(obj.C, 2) == size(X.C, 2) && norm(obj.C - X.C) + norm(obj.d - X.d) < 0.0001
-               V3 = V1 .* V2;
-               new_V = horzcat(new_c, V3);
-               S = Star(new_V, obj.C, obj.d, obj.predicate_lb, obj.predicate_ub); % new Star has the same number of basic vectors
+
+            n = obj.dim;
+            n1 = obj.nVar;
+            n2 = X.nVar;
+
+            cx = obj.V(:, 1);
+            cy = X.V(:, 1);
+            Wx = obj.V(:, 2:n1+1);
+            Wy = X.V(:, 2:n2+1);
+
+            % bounds of each factor (estimateRanges if predicate bounds
+            % cover all predicate variables, otherwise exact ranges via
+            % LP; a 0-predicate star with 0x1 bounds counts as covered)
+            obj_has_bounds = size(obj.predicate_lb, 1) == n1 && size(obj.predicate_ub, 1) == n1;
+            X_has_bounds = size(X.predicate_lb, 1) == n2 && size(X.predicate_ub, 1) == n2;
+            if obj_has_bounds
+                [lx, ux] = obj.estimateRanges;
             else
-                V3 = horzcat(V1, V2);
-                % new_c = obj.V(:, 1) + X.V(:, 1);
-                new_V = horzcat(new_c, V3);        
-                new_C = blkdiag(obj.C, X.C);        
-                new_d = vertcat(obj.d, X.d);
-                new_pred_lb = [obj.predicate_lb; X.predicate_lb];
-                new_pred_ub = [obj.predicate_ub; X.predicate_ub];
-                S = Star(new_V, new_C, new_d, new_pred_lb, new_pred_ub); % new Star has more number of basic vectors
+                [lx, ux] = obj.getRanges;
+            end
+            if X_has_bounds
+                [ly, uy] = X.estimateRanges;
+            else
+                [ly, uy] = X.getRanges;
+            end
+
+            % output is the new predicate variables z, predicate vector is
+            % [alpha (n1); beta (n2); z (n)]
+            new_V = [zeros(n, 1+n1+n2, 'like', obj.V), eye(n, 'like', obj.V)];
+
+            % original constraints on alpha and beta, padded for z
+            C0 = blkdiag(obj.C, X.C);
+            C0 = [C0, zeros(size(C0, 1), n, 'like', obj.V)];
+            d0 = [obj.d; X.d];
+
+            % McCormick constraints, one block of n rows each, over
+            % [alpha; beta; z]:
+            %   lower:  a*Wy(i,:)*beta + b*Wx(i,:)*alpha - z(i) <= a*b - a*cy(i) - b*cx(i)
+            %           with (a,b) = (lx,ly) and (ux,uy)
+            %   upper: -a*Wy(i,:)*beta - b*Wx(i,:)*alpha + z(i) <= a*cy(i) + b*cx(i) - a*b
+            %           with (a,b) = (ux,ly) and (lx,uy)
+            I = eye(n, 'like', obj.V);
+            Cm = [ ly.*Wx,  lx.*Wy, -I;
+                   uy.*Wx,  ux.*Wy, -I;
+                  -ly.*Wx, -ux.*Wy,  I;
+                  -uy.*Wx, -lx.*Wy,  I];
+            dm = [lx.*ly - lx.*cy - ly.*cx;
+                  ux.*uy - ux.*cy - uy.*cx;
+                  ux.*cy + ly.*cx - ux.*ly;
+                  lx.*cy + uy.*cx - lx.*uy];
+
+            new_C = [C0; Cm];
+            new_d = [d0; dm];
+
+            % range of z is attained at the corners of the factor box
+            corners = [lx.*ly, lx.*uy, ux.*ly, ux.*uy];
+            z_lb = min(corners, [], 2);
+            z_ub = max(corners, [], 2);
+
+            if obj_has_bounds && X_has_bounds
+                new_pred_lb = [obj.predicate_lb; X.predicate_lb; z_lb];
+                new_pred_ub = [obj.predicate_ub; X.predicate_ub; z_ub];
+                S = Star(new_V, new_C, new_d, new_pred_lb, new_pred_ub);
+            else
+                S = Star(new_V, new_C, new_d);
             end
 
         end
@@ -2024,6 +2094,49 @@ classdef Star
 
 
     methods(Static) % helper functions
+
+        function [plb, pub] = updatePredicateRanges(a, b, plb, pub)
+            % nnenum-style LP-free predicate-bound contraction (CAV 2020,
+            % "Contract-Simple"). Given a SINGLE new constraint row a*alpha <= b
+            % (one that was just appended to the star's C*alpha<=d during a ReLU
+            % split) and the current per-variable predicate box [plb, pub],
+            % tighten the box by interval-propagating that one constraint.
+            %
+            % @a    : 1 x nVar (or nVar x 1) constraint row
+            % @b    : scalar rhs
+            % @plb,@pub : nVar x 1 predicate lower/upper bounds (contracted in place)
+            %
+            % SOUND: the box is only ever shrunk to the interval implied by a
+            % constraint already present in C*alpha<=d, so no feasible alpha is
+            % removed -- the represented set {V*[1;alpha] : C*alpha<=d} is
+            % unchanged; only its box descriptor tightens. estimateRange over the
+            % smaller box stays a sound over-approximation of the true range.
+            if isempty(plb) || isempty(pub)
+                return;                          % no box to contract against
+            end
+            a = a(:).';                          % force row
+            apos = max(a, 0);  aneg = min(a, 0);
+            Slo = apos*plb + aneg*pub;           % min of a*alpha over the box
+            for j = find(a ~= 0)
+                % remove variable j's contribution from the interval minimum,
+                % then isolate alpha_j against a*alpha <= b.
+                if a(j) > 0
+                    rest_lo = Slo - a(j)*plb(j);
+                    new_ub  = (b - rest_lo) / a(j);   % alpha_j <= new_ub
+                    if new_ub < pub(j), pub(j) = max(new_ub, plb(j)); end
+                else % a(j) < 0  (dividing flips the inequality sense)
+                    rest_lo = Slo - a(j)*pub(j);
+                    new_lb  = (b - rest_lo) / a(j);   % alpha_j >= new_lb
+                    if new_lb > plb(j), plb(j) = min(new_lb, pub(j)); end
+                end
+            end
+            % numerical safety: keep plb <= pub (clip to midpoint, never widen).
+            bad = plb > pub;
+            if any(bad)
+                mid = 0.5*(plb(bad) + pub(bad));
+                plb(bad) = mid;  pub(bad) = mid;
+            end
+        end
 
         % generate random star set
         function S = rand(dim)

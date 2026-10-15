@@ -1,0 +1,253 @@
+name: VNN-COMP sweep (cloud, matrix)
+
+# On-demand FULL cloud sweep of the VNN-COMP benchmarks: one parallel job PER
+# benchmark (so each gets its own ~6 h budget, like the competition), each running
+# ALL resolvable instances (run_which=all) of its benchmark via run_all_benchmarks.
+# An aggregate job combines the per-benchmark CSVs and (optionally) compares to the
+# official VNN-COMP 2025 results. Free GitHub-hosted runners (public repo ->
+# matlab-actions auto-licenses all toolboxes). Per-benchmark sparse-checkout keeps the
+# clone small. Defaults to the official 2025 benchmark repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      benchmarks_repo:
+        description: "Git URL of the VNN-COMP benchmarks repo"
+        type: string
+        default: "https://github.com/VNN-COMP/vnncomp2026_benchmarks.git"
+      benchmarks_ref:
+        description: "Branch/tag/sha of the benchmarks repo"
+        type: string
+        default: "main"
+      benchmarks_subdir:
+        description: "Path to the benchmarks folder inside that repo"
+        type: string
+        default: "benchmarks"
+      timeout_s:
+        description: "Per-instance wall-clock timeout (s)"
+        type: string
+        default: "120"
+      run_which:
+        description: "Instances per benchmark: 'all' (full set) or 'first' (one representative)"
+        type: string
+        default: "all"
+      eps_shrink:
+        description: "Optional epsilon shrink in (0,1) for a tractability smoke test (blank = full epsilon)"
+        type: string
+        default: ""
+      release:
+        description: "MATLAB release"
+        type: string
+        default: "R2026a"
+      compare_2025:
+        description: "Aggregate: clone vnncomp2025_results and compare NNV vs 2025 + other tools"
+        type: boolean
+        default: true
+
+concurrency:
+  group: vnncomp-sweep-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        # The VNN-COMP 2026 benchmark set (github.com/VNN-COMP/vnncomp2026_benchmarks,
+        # 34 folders minus the `test` scaffold). Carried-over 2025 benchmarks plus the new
+        # 2026 entries (cgan2026, soundnessbench_2026, relusplitter_2026, and the four
+        # extended/VNN-LIB-2.0 ones: adaptive_cruise_control_non_linear_2026,
+        # isomorphic_acasxu_2026, monotonic_acasxu_2026, smart_turn_multimodal_2026 --
+        # these will error/unknown until the 2.0 bridge lands; included for visibility).
+        folder:
+          - acasxu_2023
+          - adaptive_cruise_control_non_linear_2026
+          - cctsdb_yolo_2023
+          - cersyve
+          - cgan2026
+          - cgan_2023
+          - challenging_certified_training_2026
+          - cifar100_2024
+          - collins_aerospace_benchmark
+          - collins_rul_cnn_2022
+          - cora_2024
+          - dist_shift_2023
+          - isomorphic_acasxu_2026
+          - linearizenn_2024
+          - lsnc_relu
+          - malbeware
+          - metaroom_2023
+          - ml4acopf_2024
+          - monotonic_acasxu_2026
+          - nn4sys
+          - relusplitter
+          - relusplitter_2026
+          - safenlp_2024
+          - sat_relu
+          - smart_turn_multimodal_2026
+          - soundnessbench
+          - soundnessbench_2026
+          - tinyimagenet_2024
+          - tllverifybench_2023
+          - traffic_signs_recognition_2023
+          - vggnet16_2022
+          - vit_2023
+          - yolo_2023
+    steps:
+      - name: Checkout NNV
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Reclaim runner disk space
+        run: |
+          echo "Disk before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/lib/android \
+                      /usr/share/swift /usr/local/share/powershell \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/chromium /usr/local/share/boost || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "Disk after:"; df -h /
+
+      - name: Clone this benchmark only (sparse, shallow)
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            --branch "${{ github.event.inputs.benchmarks_ref }}" \
+            "${{ github.event.inputs.benchmarks_repo }}" vnncomp2025_benchmarks
+          cd vnncomp2025_benchmarks
+          git sparse-checkout set "${{ github.event.inputs.benchmarks_subdir }}/${{ matrix.folder }}"
+          echo "Files for ${{ matrix.folder }}:"; ls -1 "${{ github.event.inputs.benchmarks_subdir }}/${{ matrix.folder }}" | head
+
+      - name: Setup MATLAB
+        uses: matlab-actions/setup-matlab@v3
+        with:
+          release: ${{ github.event.inputs.release }}
+          cache: true
+          products: >
+            Computer_Vision_Toolbox
+            Control_System_Toolbox
+            Deep_Learning_Toolbox
+            Image_Processing_Toolbox
+            Optimization_Toolbox
+            Parallel_Computing_Toolbox
+            Statistics_and_Machine_Learning_Toolbox
+            Symbolic_Math_Toolbox
+            System_Identification_Toolbox
+            Deep_Learning_Toolbox_Converter_for_ONNX_Model_Format
+            Deep_Learning_Toolbox_Converter_for_PyTorch_Model_Format
+
+      - name: Restore NNV tbxmanager toolboxes (shared cache)
+        id: tbxcache
+        uses: actions/cache/restore@v4
+        with:
+          path: code/nnv/tbxmanager
+          key: nnv-tbxmanager-${{ runner.os }}-${{ hashFiles('code/nnv/install.m') }}
+          restore-keys: |
+            nnv-tbxmanager-${{ runner.os }}-
+
+      - name: Clear committed results CSVs from the checkout (avoid polluting the artifact)
+        shell: bash
+        run: rm -f code/nnv/examples/Submission/VNN_COMP2026/results_*.csv
+
+      # Manifest categories: MATLAB's importNetworkFromONNX cannot parse these, so NNV
+      # imports them via the Python importer (onnx2nnv.py -> <model>.nnv.mat). Mirrors the
+      # submission prepare_instance.sh; cheap (~1-3 s/model). Matches both the 2025 and 2026
+      # folder names (cgan_2023/cgan2026, soundnessbench/soundnessbench_2026, etc.).
+      - name: Generate NNV manifests for manifest categories (Python importer)
+        if: ${{ contains(matrix.folder, 'lsnc_relu') || contains(matrix.folder, 'traffic_signs') || contains(matrix.folder, 'cgan') || contains(matrix.folder, 'soundnessbench') || contains(matrix.folder, 'vit') }}
+        shell: bash
+        run: |
+          python3 -m pip install --quiet onnx==1.20.0 onnxruntime==1.23.1 numpy scipy onnxsim onnxoptimizer
+          BENCH="$GITHUB_WORKSPACE/vnncomp2025_benchmarks/${{ github.event.inputs.benchmarks_subdir }}/${{ matrix.folder }}"
+          shopt -s nullglob
+          # The 2026 benchmark set ships ONNX GZIPPED (<model>.onnx.gz). The manifest glob
+          # below matches *.onnx, so without decompressing first it found NOTHING and
+          # generated ZERO manifests -> every manifest-category instance errored
+          # (lsnc_relu/traffic_signs "manifest not found"; cgan/soundnessbench fell back).
+          # Decompress (keep the .gz) so the glob sees <model>.onnx. (2025 layout is already
+          # plain, so the gz loop is a no-op there via nullglob.)
+          for gz in "$BENCH"/onnx/*.onnx.gz "$BENCH"/1.0/onnx/*.onnx.gz "$BENCH"/2.0/onnx/*.onnx.gz; do
+            gunzip -kf "$gz"
+          done
+          # 2025 layout is <folder>/onnx/; 2026 splits by VNN-LIB version <folder>/{1.0,2.0}/onnx/
+          # (2.0 included for extended-track / 2.0-only benchmarks; nullglob no-ops when absent).
+          for onnx in "$BENCH"/onnx/*.onnx "$BENCH"/1.0/onnx/*.onnx "$BENCH"/2.0/onnx/*.onnx; do
+            echo "manifest: $(basename "$onnx")"
+            python3 code/nnv/tools/onnx2nnv_python/onnx2nnv.py "$onnx" "${onnx%.onnx}.nnv.mat" \
+              || echo "WARN: manifest generation failed for $onnx"
+          done
+
+      - name: Run sweep for ${{ matrix.folder }} (run_which=${{ github.event.inputs.run_which }})
+        uses: matlab-actions/run-command@v2
+        timeout-minutes: 330
+        with:
+          command: |
+            cd('code/nnv'); install;
+            cd(fullfile('examples','Submission','VNN_COMP2026'));
+            bench = fullfile(getenv('GITHUB_WORKSPACE'), 'vnncomp2025_benchmarks', '${{ github.event.inputs.benchmarks_subdir }}');
+            to = str2double('${{ github.event.inputs.timeout_s }}'); if isnan(to), to = 120; end
+            es = '${{ github.event.inputs.eps_shrink }}'; if ~isempty(es), setenv('NNV_EPS_SHRINK', es); end
+            rw = '${{ github.event.inputs.run_which }}'; if isempty(rw), rw = 'all'; end
+            run_all_benchmarks(bench, to, {'${{ matrix.folder }}'}, rw);
+
+      - name: Save NNV tbxmanager cache (only a COMPLETE install, only on a miss)
+        if: always() && steps.tbxcache.outputs.cache-hit != 'true' && hashFiles('code/nnv/tbxmanager/toolboxes/sedumi/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: code/nnv/tbxmanager
+          key: nnv-tbxmanager-${{ runner.os }}-${{ hashFiles('code/nnv/install.m') }}
+
+      - name: Upload ${{ matrix.folder }} results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-${{ matrix.folder }}
+          path: code/nnv/examples/Submission/VNN_COMP2026/results_*.csv
+          if-no-files-found: warn
+
+  aggregate:
+    needs: sweep
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: sweep-artifacts
+          pattern: sweep-*
+          merge-multiple: true
+      - name: Combine per-benchmark CSVs
+        run: |
+          out=results_all.csv
+          echo "subfolder,category,onnx,vnnlib,status,status_str,time_s,error_message" > "$out"
+          find sweep-artifacts -name 'results_*.csv' -exec sh -c 'tail -n +2 "$1"' _ {} \; >> "$out"
+          echo "Combined $(($(wc -l < "$out") - 1)) instance rows."
+          python3 nnv/code/nnv/tools/vnncomp_compare/summarize_sweep.py "$out" > sweep_summary.md || \
+            python3 code/nnv/tools/vnncomp_compare/summarize_sweep.py "$out" > sweep_summary.md || \
+            echo "(summarizer not found on this checkout path)" > sweep_summary.md
+          cat sweep_summary.md
+      - name: Compare to VNN-COMP 2025 results + other tools
+        if: ${{ github.event.inputs.compare_2025 == 'true' }}
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/VNN-COMP/vnncomp2025_results.git vnncomp2025_results || \
+            git clone --depth 1 https://github.com/ChristopherBrix/vnncomp2025_results.git vnncomp2025_results || true
+          SCRIPT=code/nnv/tools/vnncomp_compare/compare_to_2025.py
+          [ -f "$SCRIPT" ] || SCRIPT=nnv/code/nnv/tools/vnncomp_compare/compare_to_2025.py
+          python3 "$SCRIPT" --new results_all.csv --results2025 vnncomp2025_results > comparison_2025.md 2>&1 || \
+            echo "comparison script failed (see log)" > comparison_2025.md
+          cat comparison_2025.md
+      - name: Upload aggregated results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnncomp-sweep-aggregate
+          path: |
+            results_all.csv
+            sweep_summary.md
+            comparison_2025.md
+          if-no-files-found: warn

@@ -17,6 +17,15 @@ function property = load_vnnlib(propertyFile)
 %
 %    If the vnnlib does not meet these conditions, this function may not work
 
+    % VNN-LIB 2.0 dispatch: 2.0 files start with a `(vnnlib-version <2.0>)` header
+    % and use a different grammar (declare-network, bracket indexing). Route those
+    % to the dedicated 2.0 parser; 1.0 files (no such header, including the handful
+    % of 1.0-syntax files mislabeled into a 2.0/ folder) fall through unchanged.
+    if is_vnnlib2(propertyFile)
+        property = load_vnnlib2(propertyFile);
+        return;
+    end
+
     fileID = fopen(propertyFile,'r'); % open vnnlib file
     tline = fgetl(fileID); % Reading file line-by-line
     phase = "start"; % there are four phases in each file (declare inputs, declare outputs, define inputs, define outputs)
@@ -120,9 +129,32 @@ function property = load_vnnlib(propertyFile)
                     last_ast = property.prop{n2};
                     if length(last_ast) > 1 % means previous ast was an "or"
                         property.prop{n2+1} = ast;
-                    elseif contains(propertyFile, "quadrotor2d_state") % quick fix for lsnc_relu
-                        last_ast.Hg = [last_ast.Hg; ast.Hg];
+                    elseif numel(last_ast.Hg) > 1
+                        % The running unsafe region is an OR (Hg is an array of disjunct
+                        % HalfSpaces). A standalone assertion that follows the (or ...) is
+                        % a CONJUNCT and must be AND-ed into EVERY disjunct (append its
+                        % rows to each), so the unsafe region stays (d1 AND c) OR
+                        % (d2 AND c) OR ...  The old `% quick fix for quadrotor2d_state`
+                        % instead APPENDED it as a new OR term ([Hg; ast.Hg]), dropping
+                        % the conjunction -> witnesses that satisfy a disjunct but violate
+                        % the conjunct were accepted as SAT (false counterexamples, -150).
+                        for di = 1:numel(last_ast.Hg)
+                            last_ast.Hg(di).G = [last_ast.Hg(di).G; ast.Hg.G];
+                            last_ast.Hg(di).g = [last_ast.Hg(di).g; ast.Hg.g];
+                        end
                         property.prop{n2} = last_ast;
+                    elseif numel(ast.Hg) > 1
+                        % Mirror of the case above, OPPOSITE order: a standalone conjunct c
+                        % was asserted BEFORE this (or ...). The result is still
+                        % (d1 AND c) OR (d2 AND c) OR ..., so AND the running conjunct's
+                        % rows into EVERY disjunct of the new OR and keep the OR.
+                        % (The old code did [last_ast.Hg.G; ast.Hg.G] with a multi-element
+                        % ast.Hg, which errored -> lost the instance.)
+                        for di = 1:numel(ast.Hg)
+                            ast.Hg(di).G = [ast.Hg(di).G; last_ast.Hg.G];
+                            ast.Hg(di).g = [ast.Hg(di).g; last_ast.Hg.g];
+                        end
+                        property.prop{n2} = ast;
                     else
                         last_ast.Hg.G = [last_ast.Hg.G; ast.Hg.G];
                         last_ast.Hg.g = [last_ast.Hg.g; ast.Hg.g];
@@ -151,12 +183,44 @@ end % end function
 
 %% Helper Functions
 
-% combine multiple lines into a single one if they belong to a single statement/assertion
+% Sniff whether a file is VNN-LIB 2.0: its first non-comment, non-blank line is a
+% `(vnnlib-version ...)` header (the 2.0 grammar requires this header first). 1.0
+% files -- and the 1.0-syntax files some 2026 benchmarks place under a 2.0/ folder --
+% have no such header and return false, so they take the unchanged 1.0 path. We key
+% ONLY on the version header (not `declare-network`) to keep dispatch exactly the
+% documented contract and never misroute a file that merely mentions the token.
+function tf = is_vnnlib2(propertyFile)
+    tf = false;
+    fid = fopen(propertyFile, 'r');
+    if fid < 0, return; end
+    cleaner = onCleanup(@() fclose(fid));
+    for it = 1:200   % scan past leading comments/blank lines only
+        ln = fgetl(fid);
+        if ~ischar(ln), return; end
+        ln = strtrim(ln);
+        if isempty(ln) || startsWith(ln, ';'), continue; end
+        tf = startsWith(ln, '(vnnlib-version');
+        return;   % first meaningful line decides
+    end
+end
+
+% combine multiple lines into a single one if they belong to a single statement/assertion.
+% ITERATIVE (was recursive: one stack frame per appended line -> a statement spanning many lines,
+% e.g. the big multi-line output disjunction of the larger traffic_signs nets, overflowed the stack
+% -> "Out of memory / infinite recursion"). The loop has no depth limit. On EOF before the parens
+% balance (a truncated/malformed spec) we ERROR with a clear message: the old recursive code appended
+% fgetl's numeric -1 and recursed forever (-> OOM), and a silent break-and-return would leave tline
+% unbalanced so the CALLER (load_vnnlib's main loop, which re-enters merge_lines on any unbalanced
+% line) would loop forever (hang). Erroring fails loudly instead, and the runner's load guard turns it
+% into a sound 'unknown'. Well-formed specs always balance before EOF, so they never reach the error.
 function tline = merge_lines(tline, fileID)
-    if count(tline, '(') ~= count(tline, ')')
+    while count(tline, '(') ~= count(tline, ')')
         nextLine = fgetl(fileID);
+        if ~ischar(nextLine)   % EOF before parens balanced -> truncated/malformed spec
+            error('load_vnnlib:unbalancedEOF', ...
+                  'Unbalanced parentheses at EOF while merging a multi-line vnnlib statement (truncated or malformed spec).');
+        end
         tline = [tline nextLine];
-        tline = merge_lines(tline, fileID);
     end
 end
 
@@ -350,7 +414,7 @@ function [lb_input, ub_input] =  process_input_constraint(tline, lb_input, ub_in
         dim = str2double(dim{2})+1;
         value = split(t{3},')');
         value = single(str2double(value{1}));
-        if contains(t{1},">=")
+        if contains(t{1},">")        % ">" or ">=" -> lower bound ("<"/"<=" never contain ">")
             lb_input(dim) = value;
         else
             ub_input(dim) = value;
@@ -365,7 +429,14 @@ function [lb_array, ub_array, prop_array] = process_combined_input_output(tline,
     lb_array = cell(n,1);
     ub_array = cell(n,1);
     prop_array = cell(n,1);
+    lb_global = lb_input;   % the globally-declared input box; each disjunct of the OR
+    ub_global = ub_input;   % starts fresh from it so an input bound set in one disjunct
+                            % cannot LEAK into the next (mirrors the process_multiple_inputs
+                            % fix). Without this reset, disjunct i accumulates every prior
+                            % disjunct's X bounds -> wrong (too-narrow) box -> -150 risk.
     for i = 1:length(all_cons)
+        lb_input = lb_global;
+        ub_input = ub_global;
         combo = all_cons{i};
         combo = combo + ")";
         single_cons = extractBetween(combo, "(", ")");
@@ -424,6 +495,8 @@ function [lb_array, ub_array] = process_multiple_inputs(tline, lb_input, ub_inpu
     lb_array = {};
     ub_array = {};
     arr_count = 0;
+    lb_global = lb_input;   % the globally-declared bounds; each disjunct starts fresh from
+    ub_global = ub_input;   % these so a bound set in one disjunct cannot LEAK into the next.
     while ~isempty(tline) > 0 && pars > 0
         tline = strtrim(tline);
         if startsWith(tline,'(<=') || startsWith(tline,'(>=')
@@ -434,14 +507,16 @@ function [lb_array, ub_array] = process_multiple_inputs(tline, lb_input, ub_inpu
             constraint_char = constraint_char{1};
             [lb_input, ub_input] = process_input_constraint(constraint_char, lb_input, ub_input);
             tline = tline(length(constraint_char)+2:end); % update tline, process remainder of assertion
-        
+
         elseif startsWith(tline,'(or')
             error("Currently we do not support an OR statement within and OR statement.")
-    
+
         elseif startsWith(tline,'(and')
             % parse all constraints with the "and" statement
             % if multiple *and* statements, then H -> [# ands, dim], and g a [# ands, 1]
             arr_count = arr_count + 1;
+            lb_input = lb_global;   % reset to the global box for this disjunct (no leak from
+            ub_input = ub_global;   % the previous disjunct's per-dimension constraints)
             tline = tline(5:end);
             pars = pars + 1;
         

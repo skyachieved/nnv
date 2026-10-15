@@ -1,0 +1,110 @@
+#!/bin/bash
+# VNN-COMP 2026 prepare_instance.sh for NNV. Must be FAST (<=10 min budget) and do
+# NO verification work -- only clean state so the per-instance run starts fresh.
+# Args: v1, category, onnx_path, vnnlib_path.
+
+TOOL_NAME="nnv"
+VERSION_STRING="v1"
+if [ "$1" != "${VERSION_STRING}" ]; then
+    echo "Expected first argument (version string) '${VERSION_STRING}', got '$1'"
+    exit 1
+fi
+echo "Preparing ${TOOL_NAME} for category '$2' (onnx='$3', vnnlib='$4')"
+
+# Clear any zombie MATLAB/python from a previous instance so startup is clean.
+# NNV_SKIP_PREP_KILL=1 (set by a dev-sweep PRE-PASS) skips the kill so we don't terminate the sweep's own
+# persistent MATLAB sessions / the MATLAB-MCP. Competition leaves it unset -> kill runs as before.
+if [ "${NNV_SKIP_PREP_KILL}" != "1" ]; then
+    killall -q python3 2>/dev/null
+    pkill -f -q matlab 2>/dev/null
+fi
+
+# Manifest categories: MATLAB's importNetworkFromONNX cannot parse these models, so NNV
+# imports them via the Python importer (onnx2nnv.py -> <model>.nnv.mat). Generating the
+# manifest here is allowed setup -- it is format CONVERSION, not analysis -- and is cheap
+# (~1-3 s/model, far under the 10 min prepare cap). The forward pass of each manifest is
+# cross-validated vs onnxruntime; any SAT witness is replayed through onnxruntime before
+# being emitted, so a mis-import degrades to error/unknown, never an unsound verdict.
+NNV_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"   # VNN_COMP2026 -> .../code/nnv
+# Resolve a python that HAS the onnx2nnv stack. Competition: install_tool.sh installs it into system python3.
+# Dev box: the stack lives in ~/taylor_venv. Hardcoding `python3` silently fails manifest gen on the dev box
+# (the 2026-06-25 prep-parity miss). Prefer NNV_ORT_PYTHON, then ~/taylor_venv, then python3/python — pick the
+# first that imports the full stack. Mirrors execute.py's resolver + the python_exe preference.
+# Source the competition env so NNV_ORT_PYTHON points at the python post_install actually installed the
+# onnx2nnv stack into (a deadsnakes python3.12/3.11/3.13 -- the pre-installed system python3.10 is too old
+# for the R2026a engine). prepare did NOT source this (run_instance.sh does), so NNV_ORT_PYTHON was unset and
+# PREP_PY fell back to the bare system python3 (no numpy) -> onnx2nnv manifest gen FAILED -> the manifest
+# cats LOAD FAILED -> unknown (task 314: cgan2026/lsnc_relu/traffic_signs/soundnessbench_2026). Also probe the
+# deadsnakes pythons directly, as a backstop matching post_install's install targets. Sourcing the env in
+# prepare is side-effect-free for verification (prepare only generates manifests; run_instance is a separate
+# process with its own env).
+source "$(dirname "${BASH_SOURCE[0]}")/vnncomp2026_env.sh" 2>/dev/null || true
+PREP_PY=""
+for c in "${NNV_ORT_PYTHON}" "${HOME}/taylor_venv/bin/python3" /usr/bin/python3.13 /usr/bin/python3.12 /usr/bin/python3.11 python3 python; do
+    [ -n "$c" ] || continue
+    if "$c" -c 'import numpy,scipy,onnx,onnxruntime,onnxsim,onnxoptimizer' 2>/dev/null; then PREP_PY="$c"; break; fi
+done
+[ -n "${PREP_PY}" ] || PREP_PY=python3
+gen_manifest() {
+    local onnx="$1"
+    local manifest="${onnx%.onnx}.nnv.mat"
+    if [ ! -f "${manifest}" ]; then
+        echo "Generating NNV manifest: ${manifest} (via ${PREP_PY})"
+        "${PREP_PY}" "${NNV_ROOT}/tools/onnx2nnv_python/onnx2nnv.py" "${onnx}" "${manifest}" \
+            || echo "WARN: manifest generation failed; run_instance will report error/unknown."
+    fi
+}
+case "$2" in
+    *lsnc_relu*|*traffic_signs*|*cgan*|*soundnessbench*|*vit*|*test*|*linearize*|*ml4acopf*)
+        gen_manifest "$3"
+        ;;
+    *nn4sys*)
+        # mscn + pensieve route via the manifest (lindex uses MATLAB's importNetworkFromONNX).
+        # mscn_2048d_dual.onnx is corrupt upstream and abstains to unknown in run_vnncomp_instance,
+        # so don't waste time trying to convert it.
+        case "$3" in
+            *mscn_2048d_dual*) : ;;
+            *mscn*|*pensieve*) gen_manifest "$3" ;;
+        esac
+        ;;
+esac
+
+# Net cache: importNetworkFromONNX + matlab2nnv is ONNX-determined, so pre-build the NNV net cache
+# ONCE per onnx HERE (untimed prepare; VNN-COMP allows ONNX->format conversion in prepare, same as
+# the manifests above) so the timed run loads a cached net (.netcache.mat) instead of re-converting
+# (~10 s/instance saved; a category with many vnnlib instances pays the conversion once). Skipped
+# if the cache already exists. Soundness: the cache is keyed (onnx size+mtime+NNV version) so a hit
+# is only for the SAME onnx -- run_vnncomp_instance re-imports on any mismatch. Pre-build via
+# NNV_PREP_CACHE=1, which makes run_vnncomp_instance return right after building the cache.
+MATLAB_BIN="${MATLAB_BIN:-matlab}"
+build_netcache() {
+    local cat="$1" onnx="$2" vnnlib="$3"
+    # Name MUST match the MATLAB side exactly: i_load_vnncomp_network_cached writes/reads
+    # [char(onnx) '.netcache.mat'] -> "<onnx>.netcache.mat" (APPENDS; does not strip .onnx).
+    # A stripped name ("model.netcache.mat") would never match, so this skip-guard would never
+    # fire and prepare would relaunch MATLAB on every instance instead of once per onnx.
+    local cache="${onnx}.netcache.mat"
+    [ -f "${cache}" ] && return
+    echo "Pre-building NNV net cache: ${cache}"
+    # cwd stays at code/nnv (NNV_ROOT) for the import: importNetworkFromONNX writes the generated
+    # custom-layer +package into cwd, and code/nnv is what startup_nnv genpath'd, so the package lands
+    # ON the path and PERSISTS for every later timed run's netcache load (without it MATLAB silently
+    # substitutes default layers -> degraded net -> 'unknown'). Keeping it in code/nnv root (not the
+    # VNN_COMP2026 subdir) matches the .gitignore rule (code/nnv/+*/) and the cwd==code/nnv assumption.
+    NNV_PREP_CACHE=1 "${MATLAB_BIN}" -batch \
+        "cd('${NNV_ROOT}'); startup_nnv; addpath('${NNV_ROOT}/examples/Submission/VNN_COMP2026'); try, run_vnncomp_instance('${cat}','${onnx}','${vnnlib}',tempname); catch ME, fprintf(2,'%s\n',ME.message); end" \
+        >/dev/null 2>&1 || echo "WARN: net cache pre-build failed; run_instance converts on first use."
+}
+# matlab2nnv (non-manifest) categories whose single (or few) network(s) are reused across many
+# vnnlib instances. Manifest categories above already cache via the .nnv.mat.
+# NNV_PREP_MANIFEST_ONLY=1 (dev-sweep pre-pass) skips the per-onnx netcache MATLAB launch -- the persistent
+# sweep runner builds the netcache itself on first load, so the pre-pass only needs the .nnv.mat manifests
+# (fast, python-only). Competition leaves it unset -> netcache pre-build runs as before.
+if [ "${NNV_PREP_MANIFEST_ONLY}" != "1" ]; then
+case "$2" in
+    *cifar100*|*tinyimagenet*|*vggnet*|*yolo*|*metaroom*|*malbeware*|*collins_rul*|*dist_shift*|*relusplitter*|*safenlp*|*sat_relu*|*cersyve*|*tllverify*|*cora*|*acasxu*|*challenging*)
+        build_netcache "$2" "$3" "$4" ;;
+esac
+fi
+
+exit 0

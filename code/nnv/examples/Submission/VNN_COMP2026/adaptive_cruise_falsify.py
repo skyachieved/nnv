@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Sound nonlinear-property falsifier for adaptive_cruise_control_non_linear_2026.
+
+NNV gates nonlinear vnnlib (X*Y, X*X) as unsupported, so this shells-out path finds a SAT
+witness by sampling the input box + forwarding the REAL onnx via onnxruntime, then accepting
+a witness ONLY if it satisfies EVERY assertion under the AUTHORITATIVE vnnlib parser (the
+`vnnlib` pypi package: parse_query_file + to_dnf for boolean structure, exact arith eval on
+the parsed AST) with a strict margin. SAT-or-unknown: never emits unsat (sampling can't prove
+it), never emits a witness the authoritative parser doesn't confirm -> the only -150 surface
+(the property semantics) is delegated to the official parser.
+
+SAT-or-unknown is NOT the only sound verdict here: when the input region is provably EMPTY (the
+nonlinear input constraint, e.g. 200*x0 >= x1^2, is infeasible over the box) there is NO input,
+hence NO counterexample, hence the property holds vacuously -> UNSAT. `certify_empty` proves this
+by INTERVAL ARITHMETIC over the SAME authoritative parsed AST (sound by construction: IA over-
+approximates, so an IA-infeasible comparison is truly infeasible), abstains to unknown on any
+uncertainty, and never claims empty unless a dense-grid refutation pass finds no feasible point.
+This is the only path that emits unsat; everything else is SAT-or-unknown.
+
+Exit codes (mirrors cctsdb_enumerate.py protocol): 10=SAT (+ witness csv), 11=UNSAT (empty input),
+12=unknown, 1=error.
+Usage: adaptive_cruise_falsify.py <onnx> <vnnlib> <witness_out_csv> [--n N] [--seed S] [--tol T]
+"""
+import sys, argparse, time
+from itertools import product as _iproduct
+import numpy as np
+
+# --- empty-input UNSAT certifier (interval arithmetic over the authoritative AST) ----------------
+EMPTY_MARGIN = 1e-6     # require a clear gap before declaring a comparison infeasible (stricter =>
+PRODUCT_CAP  = 256      # a borderline turns into a sound `unknown`, never a wrong unsat)
+
+def eprint(*a): print(*a, file=sys.stderr)
+
+def ev_arith(e, X, Y):
+    t = type(e).__name__
+    if t == 'Var':
+        idx = list(e.indices); flat = idx[-1] if idx else 0
+        return float(X[flat]) if str(e.kind).endswith('Input') else float(Y[flat])
+    if t in ('Float', 'Int', 'IntExpr'): return float(e.value)
+    if t == 'Literal': return float(e.lexeme)
+    if t == 'Negate': return -ev_arith(e.expr, X, Y)
+    if t == 'Plus': return sum(ev_arith(a, X, Y) for a in e.args)
+    if t == 'Minus': return ev_arith(e.head, X, Y) - sum(ev_arith(a, X, Y) for a in e.rest)
+    if t == 'Multiply':
+        r = 1.0
+        for a in e.args: r *= ev_arith(a, X, Y)
+        return r
+    raise ValueError("arith node " + t)
+
+def ev_cmp(c, X, Y, tol=0.0):
+    """Evaluate a single Comparison with a strict margin `tol` on inequalities."""
+    t = type(c).__name__
+    lo = ev_arith(c.lhs, X, Y); ro = ev_arith(c.rhs, X, Y)
+    if t == 'GreaterEqual': return lo >= ro + tol
+    if t == 'GreaterThan':  return lo >  ro + tol
+    if t == 'LessEqual':    return lo <= ro - tol
+    if t == 'LessThan':     return lo <  ro - tol
+    if t == 'Equal':        return lo == ro
+    # NotEqual: with a robust margin, require |lhs-rhs| >= tol (strictly stronger than `!=`, so it
+    # preserves soundness while making an accepted witness robust to numeric noise / a different
+    # runtime; falls back to exact `!=` only when tol==0).
+    if t == 'NotEqual':     return abs(lo - ro) >= tol if tol > 0 else lo != ro
+    raise ValueError("cmp node " + t)
+
+def holds_dnf(dnf, X, Y, tol=0.0):
+    """dnf = List[List[Comparison]] (precomputed). Holds iff some clause has ALL comparisons true."""
+    return any(all(ev_cmp(c, X, Y, tol) for c in clause) for clause in dnf)
+
+def split_assertions(query):
+    """Partition assertions into input-only (filters/box) vs output-involving."""
+    import vnnlib
+    def uses_output(e):
+        if type(e).__name__ == 'Var': return str(e.kind).endswith('Output')
+        for ch in e.children():
+            if uses_output(ch): return True
+        return False
+    inp, out = [], []
+    for a in query.assertions:
+        (out if uses_output(a.expr) else inp).append(a.expr)
+    return inp, out
+
+def input_box(query, nin):
+    """Tight box bounds per input feature from simple Var>=c / Var<=c comparisons (recursively)."""
+    lb = np.full(nin, -np.inf); ub = np.full(nin, np.inf)
+    def walk(e):
+        t = type(e).__name__
+        if t in ('And', 'Or'):
+            for a in e.args: walk(a)
+        elif t in ('GreaterEqual', 'GreaterThan', 'LessEqual', 'LessThan'):
+            L, R = e.lhs, e.rhs
+            # ONLY simple bounds on INPUT vars (an output Var can share a feature index with an input)
+            if type(L).__name__ == 'Var' and str(L.kind).endswith('Input') \
+                    and type(R).__name__ in ('Float', 'Int', 'Literal'):
+                i = list(L.indices)[-1]; v = ev_arith(R, [0]*nin, [0]*nin)
+                if t.startswith('Greater'): lb[i] = max(lb[i], v)
+                else: ub[i] = min(ub[i], v)
+    for a in query.assertions: walk(a.expr)
+    return lb, ub
+
+def ia_arith(e, lb, ub):
+    """Interval [lo,hi] of an INPUT-only arith AST over the box. Raises on anything we can't
+    soundly bound (output var / unknown op) -> caller abstains (never claims empty)."""
+    t = type(e).__name__
+    if t == 'Var':
+        if not str(e.kind).endswith('Input'): raise ValueError("output var in input-empty IA")
+        i = list(e.indices)[-1]; return float(lb[i]), float(ub[i])
+    if t in ('Float', 'Int', 'IntExpr'): return float(e.value), float(e.value)
+    if t == 'Literal': return float(e.lexeme), float(e.lexeme)
+    if t == 'Negate':
+        lo, hi = ia_arith(e.expr, lb, ub); return -hi, -lo
+    if t == 'Plus':
+        los = his = 0.0
+        for a in e.args: alo, ahi = ia_arith(a, lb, ub); los += alo; his += ahi
+        return los, his
+    if t == 'Minus':
+        hlo, hhi = ia_arith(e.head, lb, ub); rlo = rhi = 0.0
+        for a in e.rest: alo, ahi = ia_arith(a, lb, ub); rlo += alo; rhi += ahi
+        return hlo - rhi, hhi - rlo
+    if t == 'Multiply':
+        lo, hi = 1.0, 1.0
+        for a in e.args:
+            alo, ahi = ia_arith(a, lb, ub); cands = (lo*alo, lo*ahi, hi*alo, hi*ahi)
+            lo, hi = min(cands), max(cands)
+        return lo, hi
+    raise ValueError("ia arith node " + t)
+
+def ia_cmp_infeasible(c, lb, ub):
+    """True iff comparison c is IA-PROVABLY infeasible over the box. Any uncertainty -> False."""
+    t = type(c).__name__
+    try:
+        llo, lhi = ia_arith(c.lhs, lb, ub); rlo, rhi = ia_arith(c.rhs, lb, ub)
+    except Exception:
+        return False
+    m = EMPTY_MARGIN
+    if t == 'GreaterEqual': return lhi < rlo - m     # lhs>=rhs impossible if max(lhs) < min(rhs)
+    if t == 'GreaterThan':  return lhi <= rlo - m
+    if t == 'LessEqual':    return llo > rhi + m      # lhs<=rhs impossible if min(lhs) > max(rhs)
+    if t == 'LessThan':     return llo >= rhi + m
+    if t == 'Equal':        return lhi < rlo - m or llo > rhi + m
+    return False                                       # NotEqual / unknown -> can't prove -> abstain
+
+def prove_input_empty(inp_asserts, lb, ub):
+    """SOUND: True iff the conjunction of input-only asserts is provably empty over [lb,ub].
+    Distributes AND-of-DNF; empty iff EVERY distributed conjunction has an IA-infeasible
+    comparison. Abstains (False) on cross-product blowup."""
+    dnfs = [a.to_dnf() for a in inp_asserts]
+    if not dnfs: return False
+    size = 1
+    for d in dnfs:
+        size *= max(1, len(d))
+        if size > PRODUCT_CAP: return False            # too complex -> abstain to unknown
+    for combo in _iproduct(*dnfs):
+        comps = [c for clause in combo for c in clause]
+        if not any(ia_cmp_infeasible(c, lb, ub) for c in comps): return False
+    return True
+
+def grid_refutes_empty(inp_dnf, lb, ub, nin, seed=0):
+    """Refutation-only backstop: return a FEASIBLE point if one exists (=> the IA empty-claim is
+    WRONG, abort the unsat), else None. NEVER used to PROVE empty (a grid can miss a region)."""
+    import itertools as it
+    Yz = [0.0]
+    if nin <= 3:
+        axes = [np.linspace(lb[i], ub[i], 257) for i in range(nin)]
+        mesh = np.meshgrid(*axes); pts = np.stack([m.ravel() for m in mesh], axis=1)
+    else:
+        rng = np.random.default_rng(seed); pts = lb + (ub - lb) * rng.random((500000, nin))
+    corners = np.array(list(it.product(*[(lb[i], ub[i]) for i in range(nin)]))) if nin <= 16 else np.empty((0, nin))
+    allpts = np.vstack([pts, corners, ((lb + ub) / 2.0).reshape(1, -1)])
+    for r in range(allpts.shape[0]):
+        if all(holds_dnf(d, allpts[r], Yz, 0.0) for d in inp_dnf): return allpts[r]
+    return None
+
+def certify_empty(query):
+    """(verdict, detail), verdict in {'empty','feasible','abstain'}. 'empty' => caller may emit
+    UNSAT (sound). Anything else => do NOT emit unsat."""
+    net = query.networks[0]
+    nin = int(np.prod(net.inputs[0].shape))
+    inp_asserts, _out = split_assertions(query)
+    lb, ub = input_box(query, nin)
+    if not (np.all(np.isfinite(lb)) and np.all(np.isfinite(ub)) and np.all(ub >= lb)):
+        return 'abstain', 'no finite box'
+    try:
+        if not prove_input_empty(inp_asserts, lb, ub): return 'feasible', 'IA could not prove empty'
+    except Exception as e:
+        return 'abstain', 'IA error: %s' % e
+    pt = grid_refutes_empty([e.to_dnf() for e in inp_asserts], lb, ub, nin)
+    if pt is not None: return 'abstain', 'IA-empty REFUTED by feasible grid point (bug; abstain)'
+    return 'empty', 'IA-proved empty, grid found no feasible point'
+
+def main():
+    # Stamp the wall clock at process entry so --max-seconds bounds the WHOLE run (the vnnlib/ort
+    # import, onnx load, dynamic-batch surgery, and to_dnf precompute below, plus the sampling loop) --
+    # not just the loop. The runner derives the budget from the OFFICIAL per-instance timeout so an
+    # UNFINDABLE instance returns a graceful `unknown` (exit 12) IN-TIME, instead of grinding --n
+    # samples past the official timeout and being hard-killed by the harness (no result -> EMPTY).
+    t_start = time.time()
+    ap = argparse.ArgumentParser()
+    ap.add_argument('onnx'); ap.add_argument('vnnlib'); ap.add_argument('witness_csv')
+    ap.add_argument('--n', type=int, default=1_000_000)
+    ap.add_argument('--max-seconds', type=float, default=0.0,   # 0 = no wall bound (legacy/test callers)
+                    help='wall-clock budget from process entry; on expiry return unknown (sound, never unsat)')
+    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--tol', type=float, default=1e-2)     # ROBUST margin: excludes thin saturation
+    # artifacts (the net saturates ~100.0011, only 1.2e-4 above the 100.001 threshold -> a fp-noise-grade
+    # "violation" that could flip under the official checker). 1e-2 is ~100x a typical checker tolerance, so
+    # an accepted witness robustly clears the boundary and stays a real counterexample under any runtime.
+    args = ap.parse_args()
+    try:
+        import vnnlib, onnxruntime as ort
+    except Exception as e:
+        eprint("missing vnnlib/onnxruntime ->", e); sys.exit(12)   # cannot check -> unknown (sound)
+    try:
+        q = vnnlib.parse_query_file(args.vnnlib)
+    except Exception as e:
+        eprint("vnnlib parse failed ->", e); sys.exit(12)
+    # input dim from the network declaration
+    net = q.networks[0]
+    nin = int(np.prod(net.inputs[0].shape))
+    nout = int(np.prod(net.outputs[0].shape))
+    inp_asserts, out_asserts = split_assertions(q)
+    lb, ub = input_box(q, nin)
+    if not (np.all(np.isfinite(lb)) and np.all(np.isfinite(ub)) and np.all(ub >= lb)):
+        eprint("no finite input box -> unknown"); sys.exit(12)
+    # EMPTY-INPUT UNSAT cert (sound, interval-arithmetic over the authoritative AST + grid backstop).
+    # Short-circuits before the ORT load: an empty input region has no counterexample -> vacuously
+    # UNSAT. Abstains to unknown on any uncertainty; only 'empty' emits unsat.
+    try:
+        ev, detail = certify_empty(q)
+    except Exception as e:
+        ev, detail = 'abstain', 'certify_empty raised: %s' % e
+    if ev == 'empty':
+        eprint("input region provably empty (%s) -> UNSAT" % detail); print("UNSAT (empty input region)"); sys.exit(11)
+    # Prefer a dynamic-batch session (one-time onnx surgery: batch dim -> symbolic) so we can forward
+    # millions of samples in one call; safe for a plain Gemm/Relu FFNN. Fall back to per-sample if that
+    # fails (correctness preserved either way -- same real ONNX).
+    sess = ort.InferenceSession(args.onnx)
+    iname = sess.get_inputs()[0].name; ishape = sess.get_inputs()[0].shape
+    shp = tuple(1 if (x is None or isinstance(x, str)) else x for x in ishape)
+    batched_ok = True
+    try:
+        import onnx as _onnx
+        _m = _onnx.load(args.onnx)
+        _m.graph.input[0].type.tensor_type.shape.dim[0].dim_param = 'N'
+        if _m.graph.output:
+            _m.graph.output[0].type.tensor_type.shape.dim[0].dim_param = 'N'
+        sess = ort.InferenceSession(_m.SerializeToString())
+    except Exception as e:
+        eprint("dynamic-batch surgery failed, per-sample fallback:", e); batched_ok = False
+    rng = np.random.default_rng(args.seed)
+
+    def forward(Xb):
+        Xb = Xb.astype(np.float32)
+        if batched_ok:
+            try:
+                return sess.run(None, {iname: Xb.reshape((-1,) + shp[1:])})[0].reshape(Xb.shape[0], -1)
+            except Exception:
+                pass
+        return np.vstack([sess.run(None, {iname: Xb[r].reshape(shp)})[0].reshape(1, -1)
+                          for r in range(Xb.shape[0])])
+
+    inp_dnf = [e.to_dnf() for e in inp_asserts]      # precompute once (to_dnf is expensive)
+    out_dnf = [e.to_dnf() for e in out_asserts]
+    Yz = [0.0] * nout
+
+    def all_hold(X, Y, tol):
+        return all(holds_dnf(d, X, Y, tol) for d in inp_dnf) and \
+               all(holds_dnf(d, X, Y, tol) for d in out_dnf)
+
+    found = None
+    # Per-sample input-assertion filtering below is a Python loop (~sub-ms/sample), so one batch is the
+    # deadline granularity: a big batch can't be interrupted and overshoots the wall budget by its whole
+    # duration (a 200k batch was ~136s here -> a 10s budget overshot to 136s, defeating the cap). Keep the
+    # batch SMALL so the deadline is re-checked every ~few seconds; throughput is ~unchanged (it's O(total
+    # samples), independent of batch size) but the worst-case overshoot is now one small batch, not 136s.
+    BS = 5_000
+    done = 0
+    deadline = (t_start + args.max_seconds) if args.max_seconds > 0 else float('inf')
+    timed_out = False
+    while done < args.n and found is None:
+        if time.time() >= deadline:        # wall budget hit before a witness -> sound `unknown`
+            timed_out = True; break
+        m = min(BS, args.n - done); done += m
+        X = lb + (ub - lb) * rng.random((m, nin))
+        # keep only samples passing the (possibly nonlinear) input-only assertions
+        keep = np.array([all(holds_dnf(d, X[r], Yz, 0.0) for d in inp_dnf) for r in range(m)])
+        if not keep.any(): continue
+        Xk = X[keep]; Yk = forward(Xk)
+        for r in range(Xk.shape[0]):
+            if all(holds_dnf(d, Xk[r], Yk[r], args.tol) for d in out_dnf):
+                found = (Xk[r].copy(), Yk[r].copy()); break
+
+    if found is None:
+        if timed_out:
+            eprint("no strict witness within %.1fs wall budget (%d samples drawn) -> unknown"
+                   % (args.max_seconds, done))
+        else:
+            eprint("no strict witness in %d samples -> unknown" % args.n)
+        sys.exit(12)
+
+    Xw, _ = found
+    # AUTHORITATIVE re-validation: fresh ORT forward + every assertion must hold (strict margin)
+    Yw = forward(Xw.reshape(1, -1))[0]
+    if not all_hold(Xw, Yw, args.tol):
+        eprint("witness failed authoritative re-validation -> unknown"); sys.exit(12)
+    # also require it to hold at tol=0 trivially (sanity) and report
+    np.savetxt(args.witness_csv, Xw.reshape(-1, 1), fmt='%.10g')
+    print("SAT " + " ".join("%.10g" % v for v in Yw))
+    sys.exit(10)
+
+if __name__ == '__main__':
+    main()

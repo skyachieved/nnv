@@ -1,5 +1,7 @@
 function [fval, exitflag] = lpsolver(f, A, b, Aeq, Beq, lb, ub, lp_solver, opts)
-    % common function for al linear programming problems
+    % DIAGNOSTIC (gated): count every LP solve into a global, dumped by the reach instrumentation.
+    if ~isempty(getenv('NNV_LP_COUNT')), global NNV_LP_N; if isempty(NNV_LP_N), NNV_LP_N=0; end; NNV_LP_N=NNV_LP_N+1; end %#ok<TLEV>
+    % common function for all linear programming problems
     % for now we will set linprog with default options to solve every task,
     % seems to be faster than glpk or yalmip, and if it fails, we try glpk
     % (glpk seems a little more robust than linprog, fails less)
@@ -12,6 +14,10 @@ function [fval, exitflag] = lpsolver(f, A, b, Aeq, Beq, lb, ub, lp_solver, opts)
         lp_solver = 'linprog'; % default solver, sometimes fails with mpt, so glpk as backup
     end
 
+    if ~exist('optimoptions', 'file')
+        lp_solver = 'glpk'; % no optimoptions, so no linprog
+    end
+
     if ~exist('opts', 'var')
         opts = 'normal';
     elseif ~strcmp(opts, 'emptySet')
@@ -22,7 +28,24 @@ function [fval, exitflag] = lpsolver(f, A, b, Aeq, Beq, lb, ub, lp_solver, opts)
 
     if strcmp(dataType, "gpuArray") || isa(A, "gpuArray") % ensure it is not a gpuArray
         f = gather(f); A = gather(A); b = gather(b); lb = gather(lb);
-        Aeq = gather(Aeq); Beq = gather(Beq); ub = gather(ub); 
+        Aeq = gather(Aeq); Beq = gather(Beq); ub = gather(ub);
+    end
+
+    % box-only fast path: an LP whose inequality matrix is empty or all-zero (and no
+    % equality constraints) over a finite box predicate has the closed-form optimum
+    % sum_i min(f_i*lb_i, f_i*ub_i) -- no solver call needed. NNV's Star.getRange/getMin/
+    % getMax over a box predicate produce exactly these (a single benchmark, cifar100
+    % resnet, issues ~13.5k of them per instance, all with nnz(A)=0). The all-zero rows
+    % impose 0 <= b, vacuous iff every b >= 0 (guarded below); otherwise fall through.
+    % SOUND: the box optimum is exact (each coordinate optimizes independently over [lb,ub])
+    % and linprog returns the identical value -- this only skips the redundant solver call.
+    if (isempty(A) || nnz(A) == 0) && isempty(Aeq) && isempty(Beq) && ~isempty(f) ...
+            && ~isempty(lb) && ~isempty(ub) && all(isfinite(lb(:))) && all(isfinite(ub(:))) ...
+            && (isempty(b) || all(double(b(:)) >= 0))
+        ff = double(f(:)); llb = double(lb(:)); uub = double(ub(:));
+        fval = sum(min(ff .* llb, ff .* uub));   % min of f'x over the box (linprog minimizes)
+        exitflag = "l1";                          % match the linprog success exitflag
+        return;
     end
 
     if isempty(A)
@@ -74,12 +97,23 @@ function [fval, exitflag] = lpsolver(f, A, b, Aeq, Beq, lb, ub, lp_solver, opts)
 
     % Solve using linprog (glpk as backup)
     elseif strcmp(lp_solver, 'linprog')
-        options = optimoptions(@linprog, 'Display','none'); 
+        options = optimoptions('linprog', 'Display','none'); 
         options.OptimalityTolerance = 1e-10; % set tolerance
         % first try solving using linprog
         [~, fval, exitflag, ~] = linprog(f, A, b, Aeq, Beq, lb, ub, options);
         % found (1), not feasible point found (-2), infeasible (-5)
-        if ~( (exitflag == -2 && strcmp(opts, 'emptySet')) || ismember(exitflag, [1, -5]) ) % return existflag if one of these conditions is met
+        % SOUNDNESS HARDENING: only trust linprog's exitflag directly when it is a
+        % DEFINITIVE result -- success (1) or PROVEN-infeasible (-5). exitflag -2
+        % ("No feasible point found") is a numerical/iteration GIVE-UP, NOT a proof of
+        % infeasibility, so it must NOT be accepted as an emptySet certificate on its own
+        % (the old code short-circuited the glpk cross-check for `-2 && emptySet`). A
+        % give-up on a large/near-degenerate but FEASIBLE LP would then be reported EMPTY,
+        % which Star.isEmptySet maps to "robust" -> a possible false UNSAT (-150 direction).
+        % Now -2 always falls through to the glpk backup: EMPTY is certified only when both
+        % solvers agree infeasible (or glpk proves it); if glpk also can't decide it errors
+        % -> caught upstream as `unknown`. This can only convert a possibly-wrong robust into
+        % unknown, NEVER create a false sat. (Equality-constrained LPs still error->unknown.)
+        if ~( ismember(exitflag, [1, -5]) ) % trust only definitive linprog results; -2 -> glpk
             if ~isempty(Aeq) || ~isempty(Beq)
                 error("Problem cannot be solved by linprog, and task not supported by glpk.")
             else
@@ -97,7 +131,7 @@ function [fval, exitflag] = lpsolver(f, A, b, Aeq, Beq, lb, ub, lp_solver, opts)
     elseif strcmp(lp_solver, 'glpk')
         [~, fval, exitflag, ~] = glpk(f, A, b, lb, ub);
         if ~ismember(exitflag, [2, 5, 3, 4, 110]) % feasible (2), optimal (5), not feasible (3, 4, 110)
-            options = optimoptions(@linprog, 'Display','none'); 
+            options = optimoptions('linprog', 'Display','none'); 
             options.OptimalityTolerance = 1e-10; % set tolerance
             % first try solving using linprog
             [~, fval, exitflag, ~] = linprog(f, A, b, Aeq, Beq, lb, ub, options);

@@ -32,17 +32,75 @@ for i=1:n
             customLayer_no_NLP = 1;
         elseif contains(class(L), "PadLayer") %&& all(extractdata(struct2array(L.ONNXParams.Nonlearnables))==0)
             customLayer_no_NLP = check_layer_parameters(L);
-        elseif contains(class(L), "Reshape_To_ReshapeLayer") && length(fields(L.ONNXParams.Nonlearnables))==2
-            % future: need to check if the previous layers output size == last reshape layers dimension
-            customLayer_no_NLP = 1;
+        elseif contains(class(L), "Reshape_To_ReshapeLayer")
+            % A fused pure-Reshape chain (the class-name prefix encodes the fused
+            % ops: Reshape_To_ReshapeLayer = Reshape->...->Reshape ONLY, no weights
+            % -- unlike e.g. Gemm_To_ReshapeLayer). A double reshape whose FINAL
+            % target is flat is a data no-op for the flat star pipeline.
+            % future: check previous layer's output size == last reshape target dim
+            if isprop(L, 'ONNXParams') && length(fields(L.ONNXParams.Nonlearnables))==2
+                % pre-R2026a custom-layer form
+                customLayer_no_NLP = 1;
+            elseif isprop(L, 'Vars')
+                % R2026a importNetworkFromONNX custom layers carry the ONNX
+                % initializers in .Vars (no ONNXParams property). Accept the fused
+                % double-reshape as a no-op ONLY when, ORDER-INDEPENDENTLY (the
+                % fieldnames order of .Vars is not guaranteed to match execution
+                % order), one target is flat ([-1 N]) and the other's element
+                % count equals that same N. Reshapes never change element order,
+                % so such a pair composes to the identity on flat data regardless
+                % of which executes first. Anything else falls through to
+                % ReshapeLayer.parse (fails loud -> the runner reports unknown).
+                vf = fieldnames(L.Vars);
+                if numel(vf) == 2
+                    shp = cell(1, 2);
+                    for vi = 1:2
+                        sv = L.Vars.(vf{vi});
+                        try, sv = extractdata(sv); catch, end
+                        shp{vi} = double(sv(:)');
+                    end
+                    isflat = cellfun(@(v) numel(v) == 2 && v(1) == -1 && v(2) > 0, shp);
+                    if all(isflat)
+                        % both targets flat: identity iff the same N
+                        if shp{1}(2) == shp{2}(2)
+                            customLayer_no_NLP = 1;
+                        end
+                    elseif any(isflat)
+                        flatN = shp{find(isflat, 1)};
+                        flatN = flatN(2);
+                        other = shp{find(~isflat, 1)};
+                        % element count of the non-batch dims must equal the flat N
+                        % (the -1, if present, is the batch dim)
+                        pos = other(other > 0);
+                        if ~isempty(pos) && prod(pos) == flatN
+                            customLayer_no_NLP = 1;
+                        end
+                    end
+                end
+            end
         end
     catch
         
     end
     
 
+    % SOUNDNESS: a MID-NETWORK softmax must NOT become an identity placeholder
+    % (identity is only sound for a FINAL softmax under argmax-on-logits specs).
+    % "Final" = every subsequent layer has no effect on reachability; erring
+    % toward non-final is sound (the [0,1] bounds are merely looser).
+    if isa(L, 'nnet.cnn.layer.SoftmaxLayer') && ~is_final_softmax(Layers, i, conns)
+        Li = SoftmaxLayer(L.Name);
+        Li.IsFinalLayer = false;   % sound interval bounds (see SoftmaxLayer.reach)
+
+    elseif contains(class(L), "LogSoftmax") && ~is_final_softmax(Layers, i, conns)
+        % Log-softmax outputs lie in (-inf, 0] -- neither identity nor the
+        % softmax [0,1] bounds is sound for it mid-network. Refuse loudly.
+        error('matlab2nnv:midNetworkLogSoftmax', ...
+            ['Mid-network LogSoftmax layer ''%s'' is not supported soundly ' ...
+             '(identity passthrough would be unsound).'], L.Name);
+
     % Layers with no effect on the reachability analysis
-    if isa(L, 'nnet.cnn.layer.DropoutLayer') || isa(L, 'nnet.cnn.layer.SoftmaxLayer') || isa(L, 'nnet.cnn.layer.ClassificationOutputLayer') ...
+    elseif isa(L, 'nnet.cnn.layer.DropoutLayer') || isa(L, 'nnet.cnn.layer.SoftmaxLayer') || isa(L, 'nnet.cnn.layer.ClassificationOutputLayer') ...
             || isa(L,"nnet.onnx.layer.VerifyBatchSizeLayer") || isa(L, "nnet.cnn.layer.RegressionOutputLayer") ...
             || customLayer_no_NLP == 1 || isa(L, "nnet.onnx.layer.CustomOutputLayer") || contains(class(L), "LogSoftmax")
         Li = PlaceholderLayer.parse(L);
@@ -90,6 +148,10 @@ for i=1:n
     elseif isa(L, 'nnet.cnn.layer.TanhLayer')
             Li = TanhLayer.parse(L);
 
+    % GELU Layer (Gaussian Error Linear Unit - used in Transformers)
+    elseif isa(L, 'nnet.cnn.layer.GELULayer')
+            Li = GeluLayer.parse(L);
+
     % Batch Normalization Layer
     elseif isa(L, 'nnet.cnn.layer.BatchNormalizationLayer')
         Li = BatchNormalizationLayer.parse(L);
@@ -97,6 +159,10 @@ for i=1:n
     % Layer Normalization Layer
     elseif isa(L, 'nnet.cnn.layer.LayerNormalizationLayer')
         Li = LayerNormalizationLayer.parse(L);
+
+    % Self-Attention Layer (Transformer attention)
+    elseif isa(L, 'nnet.cnn.layer.SelfAttentionLayer')
+        Li = MultiHeadAttentionLayer.parse(L);
 
     % Max Pooling 2D Layer
     elseif isa(L, 'nnet.cnn.layer.MaxPooling2DLayer')
@@ -110,6 +176,10 @@ for i=1:n
     elseif isa(L, 'nnet.cnn.layer.AveragePooling3DLayer')
         Li = AveragePooling3DLayer.parse(L);
    
+    % Global Average Pooling 3D Layer
+    elseif isa(L, 'nnet.cnn.layer.GlobalAveragePooling3DLayer')
+        Li = GlobalAveragePooling3DLayer.parse(L);
+
     % Global Average Pooling 2D Layer
     elseif isa(L, 'nnet.cnn.layer.GlobalAveragePooling2DLayer')
         Li = GlobalAveragePooling2DLayer.parse(L);
@@ -139,14 +209,46 @@ for i=1:n
             || isa(L, 'nnet.onnx.layer.FlattenInto2dLayer') || isa(L, 'nnet.onnx.layer.Flatten3dInto2dLayer')
         Li = FlattenLayer.parse(L);
 
+    % Custom (importer-generated) flatten layer -- the MATLAB ONNX importer emits a per-model
+    % custom Formattable flatten (e.g. vgg16_7.FlattenLayer1000) for the NO-OP Flatten ops ONNX
+    % inserts before each Gemm: the operand is already a flat [N x C] vector, so the flatten is an
+    % identity reshape. (The order-critical conv->FC flatten is a standard nnet.onnx.layer.*Flatten*
+    % handled by the case above.) These custom classes are not in any isa() map, so they fall to the
+    % catch-all and error "Unsupported Class of Layer" -- which blocked the official VNN-COMP
+    % vgg16-7.onnx import. Map them to NNV's FlattenLayer (identity on already-flat input). The
+    % restriction to non-'nnet.' classes leaves the standard-layer handling and the placeholder
+    % flatten path below untouched. SOUNDNESS: validate a new architecture with a forward cross-check
+    % (NN.evaluate vs dlnetwork.predict) before trusting verdicts -- a custom flatten that is NOT a
+    % no-op would change element order; the cross-check catches that.
+    elseif contains(class(L), 'Flatten') && ~startsWith(class(L), 'nnet.')
+        Li = FlattenLayer(L.Name, L.NumInputs, L.NumOutputs, L.InputNames, L.OutputNames);
+        % NNV FlattenLayer.evaluate/reach switch on .Type, so it must be one of the KNOWN types,
+        % not the custom class string (else "Unknown type of flatten layer"). These custom layers
+        % are identity reshapes on an already-flat [N x C] operand (the layer's own predict does
+        % permute[2 1] -> flatten -> permute[2 1] = identity on 2D), so the straight-reshape
+        % 'nnet.cnn.layer.FlattenLayer' behavior (no permute -> preserves element order) is the
+        % correct, order-safe mapping. (Validated for vgg16-7 by NN.evaluate == dlnetwork.predict.)
+        Li.Type = 'nnet.cnn.layer.FlattenLayer';
+
     % Sigmoid Layer (also referred to as logsig)
     elseif isa(L, 'nnet.keras.layer.SigmoidLayer') || isa(L, 'nnet.onnx.layer.SigmoidLayer') || isa(L, 'nnet.cnn.layer.SigmoidLayer')
         Li = SigmoidLayer.parse(L);
 
     % ElementWise Affine Layer (often used as a bias layer after FC layers)
-    elseif isa(L, 'nnet.onnx.layer.ElementwiseAffineLayer')
+    % R2024b and earlier ONNX imports emit nnet.onnx.layer.ElementwiseAffineLayer.
+    % R2025a+ ONNX imports emit nnet.cnn.layer.ScalingLayer with identical
+    % Y = Scale.*X + Offset semantics (MathWorks release note:
+    % "ONNX Add, Mul, Sub, Neg, Div imported as scalingLayer"). Both route to
+    % the same parse() -- ElementwiseAffineLayer.parse now accepts either class.
+    elseif isa(L, 'nnet.onnx.layer.ElementwiseAffineLayer') || isa(L, 'nnet.cnn.layer.ScalingLayer')
+        % Both R2024b- ElementwiseAffineLayer and R2025a+ ScalingLayer route to
+        % the single parse() (Y = Scale.*X + Offset). [27]: the previous code
+        % had a SECOND, unreachable ScalingLayer branch below this one (this
+        % branch already matches nnet.cnn.layer.ScalingLayer) whose hand-rolled
+        % logic diverged from parse() -- forcing DoScale/DoOffset both true and
+        % substituting a zero offset. Removed to keep one code path.
         Li = ElementwiseAffineLayer.parse(L);
-    
+
     % Feature input layer
     elseif isa(L, 'nnet.cnn.layer.FeatureInputLayer') || isa(L, 'nnet.onnx.layer.FeatureInputLayer')
         Li = FeatureInputLayer.parse(L); 
@@ -232,44 +334,8 @@ indxs = 1:n;
 % connections in the order they appear, so need to ensure the order makes sense:
 %  - sometimes some of the skipped connections (like in resnet or unets), they appear at the end so NNV returns the wrong output
 
-
-
-% for i = 1:height(conns)
-%     % Clean Destination (remove /inX suffix)
-%     dest = conns.Destination{i};
-%     splitDest = split(dest, '/in');
-%     conns.Destination{i} = splitDest{1}; % only base layer name
-% 
-%     % Optionally, you can store the port number separately for your own use:
-%     % if length(splitDest) > 1
-%     %     portNumber(i) = str2double(splitDest{2});
-%     % else
-%     %     portNumber(i) = 1;
-%     % end
-% end
-
-% Create new columns with base name and port
-numConns = height(conns);
-baseNames = strings(numConns,1);
-portNums = zeros(numConns,1);
-
-for i = 1:numConns
-    dest = conns.Destination{i};
-    parts = split(dest, '/in');
-    baseNames(i) = parts{1};
-    if numel(parts) > 1
-        portNums(i) = str2double(parts{2});
-    else
-        portNums(i) = 1; % default if no port specified
-    end
-end
-
-% Add to the table without losing the original Destination
-conns.BaseDest = baseNames;
-conns.DestPort = portNums;
-
-
-
+% Revert back to previous working code. Navid's changes were getting stuck
+% on the while loop...
 
 if height(conns) == length(nnvLayers) - 1 % fullyconnected layers, no skips
     % Assigning layer names to correspnding index
@@ -287,27 +353,31 @@ net.name2indx = name2idx;
 
 % Get input and output sizes
 outSize = getOutputSize(Mnetwork);
-net.OutputSize = outSize;
+net.OutputSize = outSize; 
+
+net.matlabnet = Mnetwork;
+if ntype== "SeriesNetwork"
+    net.matlabnet = dag2dlnetwork(net.matlabnet);
+end
 
 end
 
 
 % Helper function for connections
-
 function [nnvLayers, nnvConns, name2number] = process_connections(nnvLayers, conns, names, idxs)
     % Assigning layer names to correspnding index
     name2number = containers.Map(names,idxs);
-    
+
     % Step 1 - initialize a variable to keep track of the number of inputs in NNV
     count_inputs = ones(length(nnvLayers),1); % order is same as nnvLayers (default = 1)
     for k=1:length(nnvLayers)
-        if contains(class(nnvLayers{k}), ["Concatenation", "Addition", "Mul"])
+        if contains(class(nnvLayers{k}), ["Concatenation", "Addition"])
             count_inputs(k) = nnvLayers{k}.NumInputs;
         elseif contains(class(nnvLayers{k}), "Input")
             count_inputs(k) = 0; % this is the initial layer, no prior connections
         end
     end
-    
+
     % Step 2 - ensure these number of inputs are seen before executing
     %       that layer, otherwise, move to the next connection
     final_sources = [];
@@ -315,42 +385,27 @@ function [nnvLayers, nnvConns, name2number] = process_connections(nnvLayers, con
     orig_sources = conns.Source;
     orig_dests = conns.Destination;
     skipped = 1: height(conns);%idxs; %start with assumption that all connections are skipped
-    
+
     % start adding cnnections to the final list
-    
-    while ~isempty(skipped)
+    while ~isempty(skipped) 
         % Get connection idx
-        %%
-        %%
         c = skipped(1);
         skipped(1) = []; % like popping the first connection from the list
         % get connection names
         source_name = orig_sources{c};
         source_layer_name = split(source_name, '/');
-
-
-        if length(source_layer_name) > 1
+        if length(source_layer_name) > 1 % either a layer with multiple dets or some "properties" like size are getting sent to other layers
             sec_name = source_layer_name{2};
-            % skip if this is a known internal property (add exceptions as needed)
-            skipSuffixes = ["BatchSizeVerifier", "someOtherIrrelevantSuffix"];
-            if ~contains(sec_name, 'out') && ismember(sec_name, skipSuffixes)
+            if ~contains(sec_name, 'out')
                 continue;
             end
         end
-        % if length(source_layer_name) > 1 % either a layer with multiple dets or some "properties" like size are getting sent to other layers
-        %     sec_name = source_layer_name{2};
-        %     if ~contains(sec_name, 'out')
-        %         continue;
-        %     end
-        % end
-
-
         source_layer_name = source_layer_name{1};
         dest_name = orig_dests{c};
         % parse dest_name as it could be defined as name/in1 and so on, then add it back at the end
         dest_layer_name = split(dest_name, '/');
         dest_layer_name = dest_layer_name{1};
-    
+
         % check if source has an input counter of 0
         source_idx = name2number(source_layer_name);
         if count_inputs(source_idx) == 0
@@ -364,22 +419,32 @@ function [nnvLayers, nnvConns, name2number] = process_connections(nnvLayers, con
             else
                 skipped = [skipped, c];
             end
-        end
-    
+        end        
+        
     end
-    
-    nnvConns = table(final_sources, final_dests, 'VariableNames', {'Source', 'Destination'});
-    
+
+    nnvConns = table(final_sources, final_dests, 'VariableNames', {'Source', 'Destination'});    
+
 end
 
 
 % Check if custom layers can be skipped (e.g., pad layer with 0 padding does not change anything in the network)
 function status = check_layer_parameters(L)
     status = 0;
-    if isempty(L.ONNXParams.Nonlearnables)
+    % R2026a importNetworkFromONNX custom layers may carry params on .Vars
+    % instead of .ONNXParams (see ReshapeLayer/UpsampleLayer). Fail closed.
+    if isprop(L, 'ONNXParams')
+        nonlearn = L.ONNXParams.Nonlearnables;
+    elseif isprop(L, 'Vars')
+        nonlearn = L.Vars;
+    else
+        error('matlab2nnv:noParams', ...
+            'Layer ''%s'' has neither ONNXParams nor Vars.', class(L));
+    end
+    if isempty(nonlearn)
         status = 1;
     elseif contains(class(L), 'PadLayer')
-        params = struct2cell(L.ONNXParams.Nonlearnables);
+        params = struct2cell(nonlearn);
         for i=1:length(params)
             tmp = extractdata(params{i});
             if ~all(tmp==0)
@@ -390,9 +455,82 @@ function status = check_layer_parameters(L)
     end
 end
 
+% A softmax is "final" (identity placeholder is sound for argmax-on-logits
+% specs) only if every GRAPH SUCCESSOR has no effect on reachability. Erring
+% toward non-final is SOUND (bounds get looser, never wrong); only treating a
+% genuinely mid-network softmax as final would be unsound.
+%
+% [22]: decide by Connections topology, not array order. The Layers array is not
+% guaranteed to be topologically sorted, so walking Layers(idx+1:end) by array
+% position could call a softmax 'final' when a real layer follows it in the
+% GRAPH but precedes it in the array. When a usable Connections table is
+% available we BFS the actual successors; otherwise we fall back to the array
+% walk (sound for the usual topologically-ordered arrays).
+function tf = is_final_softmax(Layers, idx, conns)
+    if nargin >= 3 && istable(conns) && ~isempty(conns) && ...
+            all(ismember({'Source','Destination'}, conns.Properties.VariableNames))
+        tf = is_final_softmax_topo(Layers, idx, conns);
+        return;
+    end
+    tf = true;
+    for k = idx+1:numel(Layers)
+        if ~softmax_successor_inert(Layers(k))
+            tf = false; return;
+        end
+    end
+end
+
+% True iff a successor layer has no effect on reachability (so a softmax feeding
+% only such layers is "final").
+function tf = softmax_successor_inert(Lk)
+    tf = isa(Lk, 'nnet.cnn.layer.ClassificationOutputLayer') || ...
+         isa(Lk, 'nnet.cnn.layer.RegressionOutputLayer') || ...
+         isa(Lk, 'nnet.cnn.layer.DropoutLayer') || ...
+         isa(Lk, "nnet.onnx.layer.CustomOutputLayer") || ...
+         isa(Lk, "nnet.onnx.layer.VerifyBatchSizeLayer");
+end
+
+% Topology-aware finality: BFS the softmax's graph successors via Connections.
+% Final iff EVERY reachable successor layer is inert. Layer names in the conns
+% table may carry '/port' suffixes -- strip them to match Layers(k).Name.
+function tf = is_final_softmax_topo(Layers, idx, conns)
+    names = strings(numel(Layers), 1);
+    for k = 1:numel(Layers)
+        names(k) = string(Layers(k).Name);
+    end
+    src = strip_port(string(conns.Source));
+    dst = strip_port(string(conns.Destination));
+    start = string(Layers(idx).Name);
+
+    tf = true;
+    visited = false(numel(Layers), 1);
+    frontier = start;
+    while ~isempty(frontier)
+        nextNodes = strings(0,1);
+        for f = 1:numel(frontier)
+            succ = dst(src == frontier(f));   % direct graph successors
+            for s = 1:numel(succ)
+                li = find(names == succ(s), 1);
+                if isempty(li) || visited(li), continue; end
+                visited(li) = true;
+                if ~softmax_successor_inert(Layers(li))
+                    tf = false; return;       % a real layer follows -> not final
+                end
+                nextNodes(end+1,1) = succ(s); %#ok<AGROW>
+            end
+        end
+        frontier = nextNodes;
+    end
+end
+
+function s = strip_port(s)
+    % 'layerName/out1' -> 'layerName'
+    s = extractBefore(s + "/", "/");
+end
+
 % Get output size of the network
 function outSize = getOutputSize(network)
-outSize = 0; % default
+    outSize = 0; % default
     if isa(network, "SeriesNetwork")
         outputLayer = network.Layers(end);
         if isa(outputLayer, "nnet.cnn.layer.ClassificationOutputLayer")

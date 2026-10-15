@@ -100,37 +100,240 @@ classdef ConcatenationLayer < handle
  
         % reach
         function outputs = reach_single_input(obj, inputs)
-            % @in_image: input imagestar
-            % @image: output set
-            % outputs = inputs{1};
-            % concatenate along the dimension (obj.Dim), usually channels (3)
-            
-            % Get max size of V
-            vSize = size(inputs{1}.V);
-            indexMax = 1;
-            for i = 2:length(inputs)
-                if numel(inputs{i}.V) > prod(vSize)
-                    vSize = size(inputs{i}.V);
-                    indexMax = i;
+            % @inputs: cell array of ImageStar sets to concatenate
+            % @outputs: concatenated ImageStar with properly combined constraints
+            %
+            % This method properly handles concatenation of ImageStar sets with
+            % independent predicate variables by using block-diagonal constraint
+            % matrices and preserving all constraints from all inputs.
+            %
+            % Fixed: 2024 - Previously only used constraints from one input,
+            % causing soundness issues. Now properly combines all constraints.
+
+            % Caller may pass either a cell array or a non-cell array of
+            % set objects. Normalize to a cell array.
+            if ~iscell(inputs)
+                if isa(inputs, 'Star') || isa(inputs, 'ImageStar') || isa(inputs, 'ImageZono')
+                    if numel(inputs) == 1
+                        outputs = inputs;
+                        return;
+                    end
+                    inputs = num2cell(inputs);
                 end
             end
-            
-            % Initialize V
-            new_V = zeros(vSize, 'like', inputs{1}.V);
-            new_V(:,:,:,1:size(inputs{1}.V,4)) = inputs{1}.V;
-            % Generate V
-            for i = 2:length(inputs)
-                % ensure all Vs are same dimension
-                tempV = zeros(vSize, 'like', inputs{1}.V);
-                tempV(:,:,:,1:size(inputs{i}.V,4)) = inputs{i}.V;
-                new_V = cat(obj.Dim, new_V, tempV);
+
+            n = length(inputs);
+
+            if n == 1
+                % Single input - just return it
+                outputs = inputs{1};
+                return;
             end
 
-            % Create output set
-            outputs = ImageStar(new_V, inputs{indexMax}.C, inputs{indexMax}.d, inputs{indexMax}.pred_lb, inputs{indexMax}.pred_ub);
-            
+            % Star sets (column-vector convention) take a separate path —
+            % their V is [dim, nVar+1] and they have `nVar`, not `numPred`.
+            if isa(inputs{1}, 'Star')
+                outputs = obj.reach_concat_star(inputs);
+                return;
+            end
+
+            % Collect information about all inputs
+            nVars = zeros(n, 1);  % number of predicate variables per input
+            for i = 1:n
+                nVars(i) = inputs{i}.numPred;
+            end
+            totalVars = sum(nVars);
+
+            % Get spatial dimensions from first input
+            % V has shape [H, W, C, nVar+1]
+            sz1 = size(inputs{1}.V);
+
+            % Compute output dimensions after concatenation
+            totalDimSize = 0;
+            for i = 1:n
+                szI = size(inputs{i}.V);
+                if obj.Dim <= 3
+                    totalDimSize = totalDimSize + szI(obj.Dim);
+                else
+                    error('Concatenation dimension must be 1, 2, or 3');
+                end
+            end
+
+            % Determine output spatial size
+            outSize = sz1(1:3);
+            outSize(obj.Dim) = totalDimSize;
+
+            % Build the combined V matrix
+            % new_V has shape [outH, outW, outC, totalVars+1]
+            new_V = zeros([outSize, totalVars + 1], 'like', inputs{1}.V);
+
+            % Track position along concatenation dimension and predicate index
+            dimOffset = 0;
+            varOffset = 0;
+
+            for i = 1:n
+                szI = size(inputs{i}.V);
+                dimSizeI = szI(obj.Dim);
+                nVarI = nVars(i);
+
+                % Build index ranges for this input
+                switch obj.Dim
+                    case 1
+                        idxH = dimOffset + (1:dimSizeI);
+                        idxW = 1:szI(2);
+                        idxC = 1:szI(3);
+                    case 2
+                        idxH = 1:szI(1);
+                        idxW = dimOffset + (1:dimSizeI);
+                        idxC = 1:szI(3);
+                    case 3
+                        idxH = 1:szI(1);
+                        idxW = 1:szI(2);
+                        idxC = dimOffset + (1:dimSizeI);
+                end
+
+                % Copy center (column 1 of V)
+                new_V(idxH, idxW, idxC, 1) = inputs{i}.V(:,:,:,1);
+
+                % Copy basis vectors to the correct predicate variable positions
+                % Input i's predicates go to positions (varOffset+1) to (varOffset+nVarI)
+                % In new_V, that's columns (varOffset+2) to (varOffset+nVarI+1)
+                if nVarI > 0
+                    new_V(idxH, idxW, idxC, varOffset + 2 : varOffset + nVarI + 1) = inputs{i}.V(:,:,:,2:end);
+                end
+
+                dimOffset = dimOffset + dimSizeI;
+                varOffset = varOffset + nVarI;
+            end
+
+            % Build the combined constraint matrix. Each input's constraints
+            % involve ONLY its own predicates, so input i's C must occupy the
+            % totalVars-wide column block at (varOffset_i+1 .. varOffset_i+nVars_i)
+            % -- matching where its generators live in new_V. A plain blkdiag of the
+            % non-empty C's was WRONG when an EARLIER input had empty C: it skipped
+            % that input's columns, leaving new_C too narrow / mis-aligned, which the
+            % ImageStar constructor then rejected ("Inconsistency between basic matrix
+            % and constraint matrix") -- so a box+constrained concat ERRORED instead
+            % of producing the valid set. Pad each C to totalVars and vstack (this is
+            % identical to blkdiag when ALL inputs are constrained). [Copilot #290]
+            new_C = [];
+            new_d = [];
+            new_pred_lb = [];
+            new_pred_ub = [];
+
+            vOff = 0;
+            for i = 1:n
+                if ~isempty(inputs{i}.C)
+                    Ci = zeros(size(inputs{i}.C, 1), totalVars, 'like', inputs{i}.C);
+                    Ci(:, vOff + (1:nVars(i))) = inputs{i}.C;
+                    new_C = [new_C; Ci];
+                    new_d = [new_d; inputs{i}.d];
+                end
+                new_pred_lb = [new_pred_lb; inputs{i}.pred_lb];
+                new_pred_ub = [new_pred_ub; inputs{i}.pred_ub];
+                vOff = vOff + nVars(i);
+            end
+
+            % Handle empty constraints case
+            if isempty(new_C)
+                new_C = zeros(0, totalVars);
+                new_d = zeros(0, 1);
+            end
+
+            % Create output ImageStar with combined constraints
+            outputs = ImageStar(new_V, new_C, new_d, new_pred_lb, new_pred_ub);
+
         end
-        
+
+        % Concatenation for column-vector Star sets. For NNV's column
+        % convention, only obj.Dim == 1 (the feature axis) is meaningful;
+        % we vertically stack the V matrices (with independent predicates
+        % via block-diagonal C) and union the constraints.
+        function out = reach_concat_star(obj, inputs)
+            % [14] SOUNDNESS: a column-vector Star carries NO tensor shape, so
+            % the only concatenation we can realize as a flat vertical stack
+            % ([A(:);B(:)]) is along the single feature axis (Dim==1). For any
+            % other Dim, evaluate's cat(obj.Dim,...) on the ORIGINAL tensor
+            % interleaves elements in column-major order (e.g. concatenating
+            % [T,D] tensors along Dim=1 gives [A(:,1);B(:,1);A(:,2);B(:,2);...]),
+            % which the flat stack does NOT reproduce -- a silent permutation of
+            % the output set. Refuse rather than return a permuted (unsound) set;
+            % shape-aware concatenation must go through the ImageStar path.
+            if ~isempty(obj.Dim) && obj.Dim ~= 1
+                error('ConcatenationLayer:starConcatDim', ...
+                    ['Star (column-vector) concatenation is only sound along the ' ...
+                     'feature axis Dim==1; got Dim=%d. The flat stack would permute ' ...
+                     'the output set relative to evaluate''s cat(%d,...). Use an ' ...
+                     'ImageStar (shape-aware) input for multi-axis concatenation.'], ...
+                    obj.Dim, obj.Dim);
+            end
+
+            n = length(inputs);
+            nVars = zeros(n, 1);
+            for i = 1:n
+                nVars(i) = inputs{i}.nVar;
+            end
+            totalVars = sum(nVars);
+
+            % [44] A Star built with the 3-arg Star(V,C,d) constructor has EMPTY
+            % predicate_lb/ub. Concatenating those empty vectors yields a bounds
+            % vector shorter than totalVars, which the 5-arg Star constructor
+            % rejects. Only pass explicit predicate bounds when EVERY operand
+            % provides them; otherwise omit them (the C*a<=d constraints fully
+            % define the set, so this stays sound -- only estimation is looser).
+            haveBounds = true;
+            for i = 1:n
+                if isempty(inputs{i}.predicate_lb) || isempty(inputs{i}.predicate_ub)
+                    haveBounds = false; break;
+                end
+            end
+
+            new_V = [];
+            new_C = [];
+            new_d = [];
+            new_pred_lb = [];
+            new_pred_ub = [];
+            varOffset = 0;
+            for i = 1:n
+                Vi = inputs{i}.V;       % [dim_i, nVar_i + 1]
+                ci = Vi(:, 1);           % center
+                bi = Vi(:, 2:end);       % basis
+                dim_i = size(Vi, 1);
+                % Pad basis to total predicate width with zeros
+                Bi_padded = zeros(dim_i, totalVars, 'like', Vi);
+                Bi_padded(:, varOffset + (1:nVars(i))) = bi;
+                Vi_padded = [ci, Bi_padded];
+                new_V = [new_V; Vi_padded];
+
+                if ~isempty(inputs{i}.C)
+                    % Pad input i's C to totalVars columns at its predicate block
+                    % (varOffset). Plain blkdiag was wrong when an EARLIER input had
+                    % empty C -> too-narrow / mis-aligned new_C -> Star ctor rejection
+                    % ("Inconsistency between basic matrix and constraint matrix"), so a
+                    % box+constrained concat ERRORED instead of producing the set. This
+                    % equals blkdiag when all inputs are constrained. [Copilot #290]
+                    Ci = zeros(size(inputs{i}.C, 1), totalVars, 'like', inputs{i}.C);
+                    Ci(:, varOffset + (1:nVars(i))) = inputs{i}.C;
+                    new_C = [new_C; Ci];
+                    new_d = [new_d; inputs{i}.d];
+                end
+                if haveBounds
+                    new_pred_lb = [new_pred_lb; inputs{i}.predicate_lb];
+                    new_pred_ub = [new_pred_ub; inputs{i}.predicate_ub];
+                end
+                varOffset = varOffset + nVars(i);
+            end
+            if isempty(new_C)
+                new_C = zeros(0, totalVars);
+                new_d = zeros(0, 1);
+            end
+            if haveBounds
+                out = Star(new_V, new_C, new_d, new_pred_lb, new_pred_ub);
+            else
+                out = Star(new_V, new_C, new_d);
+            end
+        end
+
         % handle multiple inputs
         function S = reach_multipleInputs(obj, inputs, option)
             % @inputs: an array of ImageStars
@@ -142,6 +345,8 @@ classdef ConcatenationLayer < handle
                 S(n) = ImageStar;
             elseif isa(inputs(1), 'ImageZono')
                 S(n) = ImageZono;
+            elseif isa(inputs(1), 'Star')
+                S(n) = Star;
             else
                 error('Unknown input data set');
             end
